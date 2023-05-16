@@ -48,7 +48,7 @@ export default class CustomJestEnvironment extends TestEnvironment {
 
         // Wait for tabs to load?
 
-        this.assignTestGlobals();
+        this.assignTestGlobals(this.global, this.testServer, this.corsServer, this.page);
     }
 
     /**
@@ -184,6 +184,7 @@ export default class CustomJestEnvironment extends TestEnvironment {
         const promise = this.awaitForEvent(`ready-${pathname}`);
         // Firefox does not resolve promise returned by page.goto()
         // Doesn't resolve due to https://github.com/puppeteer/puppeteer/issues/6616
+        // TODO(anton): remove this once Firefox supports tab.eval() via WebDriver BiDi
         if (this.global.product !== 'firefox') {
             await this.page.goto(url, gotoOptions);
         } else {
@@ -205,81 +206,119 @@ export default class CustomJestEnvironment extends TestEnvironment {
         resolves && resolves.forEach((r) => r());
     }
 
-    assignTestGlobals() {
-        this.global.getColorScheme = async () => {
-            if (this.global.product === 'firefox') {
-                throw new Error('Firefox does not support page.evaluate()');
+    /**
+     * This function is evaluated within browser's page context
+     * after being passed to page.evaluate()
+     * It can use methods which will be defined in the page context,
+     * but can not use variables defined in this file besides those passed into it.
+     */
+    async checkPageStylesInBrowserContext(expectations) {
+        const checkOne = (expectation) => {
+            const [selector, cssAttributeName, expectedValue] = expectation;
+            const selector_ = Array.isArray(selector) ? selector : [selector];
+            let element = document;
+            for (const part of selector_) {
+                if (element instanceof HTMLIFrameElement) {
+                    element = element.contentDocument;
+                }
+                if (element.shadowRoot instanceof ShadowRoot) {
+                    element = element.shadowRoot;
+                }
+                if (part === 'document') {
+                    element = element.documentElement;
+                } else {
+                    element = element.querySelector(part);
+                }
+                if (!element) {
+                    return `Could not find element ${part}`;
+                }
             }
-            const isDark = await this.page.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches);
+            const style = getComputedStyle(element);
+            if (style[cssAttributeName] !== expectedValue) {
+                return `Got ${style[cssAttributeName]}`;
+            }
+        };
+
+        const checkAll = () => {
+            /** @type{Array<[number, string]>} */
+            const errors = [];
+            for (let i = 0; i < expectations.length; i++) {
+                const error = checkOne(expectations[i]);
+                if (error) {
+                    errors.push([i, error]);
+                }
+            }
+            return errors;
+        };
+
+        let timeout = 10;
+        let errors = checkAll();
+        for (let i = 0; (errors.length !== 0) && (i < 10); i++) {
+            timeout *= 2;
+            await new Promise((r) => requestIdleCallback(r, {timeout}));
+            errors = checkAll();
+        }
+        return errors;
+    }
+
+    assignTestGlobals(global, testServer, corsServer, page) {
+        global.getColorScheme = async () => {
+            if (global.product === 'firefox') {
+                return await global.backgroundUtils.getColorScheme();
+            }
+            const isDark = await page.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches);
             return isDark ? 'dark' : 'light';
         };
 
-        this.global.evaluateScript = async (script) => {
-            if (this.global.product === 'firefox') {
+        global.pageUtils.evaluateScript = async (script) => {
+            if (global.product === 'firefox') {
                 if (typeof script !== 'function') {
                     throw new Error('Not implemented');
                 }
-                return await this.global.pageUtils.evaluate(`(${script.toString()})()`);
+                return await global.pageUtils.evaluate(`(${script.toString()})()`);
             }
-            return await this.page.evaluate(script);
+            return await page.evaluate(script);
         };
 
-        this.global.expectPageStyles = async (expect, expectations) => {
-            if (this.global.product === 'firefox') {
-                const errors = await this.global.pageUtils.expectPageStyles(expectations);
+        global.expectPageStyles = async (expect, expectations) => {
+            if (global.product === 'firefox') {
+                const errors = await global.pageUtils.expectPageStyles(expectations);
                 expect(errors.length).toBe(0);
                 return;
             }
             if (!Array.isArray(expectations[0])) {
                 expectations = [expectations];
             }
-            const promises = [];
-            for (const [selector, cssAttributeName, expectedValue] of expectations) {
-                const promise = expect(this.page.evaluate(
-                    (selector, cssAttributeName) => {
-                        let element = document;
-                        if (!Array.isArray(selector)) {
-                            selector = [selector];
-                        }
-                        for (const part of selector) {
-                            if (element instanceof HTMLIFrameElement) {
-                                element = element.contentDocument;
-                            }
-                            if (part === 'document') {
-                                element = element.documentElement;
-                            } else {
-                                element = element.querySelector(part);
-                            }
-                        }
-                        const style = getComputedStyle(element);
-                        return style[cssAttributeName];
-                    },
-                    selector, cssAttributeName
-                )).resolves.toBe(expectedValue);
-                promises.push(promise);
-            }
-            return Promise.all(promises);
+            const errors = await page.evaluate(this.checkPageStylesInBrowserContext, expectations);
+            expect(errors.length).toBe(0);
         };
 
-        this.global.emulateMedia = async (name, value) => {
-            if (this.global.product === 'firefox') {
+        global.emulateColorScheme = async (colorScheme) => {
+            if (global.product === 'firefox') {
+                await global.pageUtils.emulateColorScheme(colorScheme);
+                await global.backgroundUtils.emulateColorScheme(colorScheme);
+                const newPageColorScheme = await global.backgroundUtils.getColorScheme();
+                const newBGColorScheme = await global.pageUtils.getColorScheme();
+                if (newPageColorScheme !== colorScheme || newBGColorScheme !== colorScheme) {
+                    throw new Error('Failed to apply new color scheme');
+                }
                 return;
             }
-            await this.page.emulateMediaFeatures([{name, value}]);
-            if (this.global.product === 'chrome') {
+            await page.emulateMediaFeatures([{name: 'prefers-color-scheme', value: colorScheme}]);
+            if (global.product === 'chrome') {
                 const page = await this.getChromiumMV2BackgroundPage();
-                await page.emulateMediaFeatures([{name, value}]);
+                await page.emulateMediaFeatures([{name: 'prefers-color-scheme', value: colorScheme}]);
             }
         };
 
-        this.global.loadTestPage = async (paths, gotoOptions) => {
+        global.loadTestPage = async (paths, gotoOptions) => {
             const {cors, ...testPaths} = paths;
-            this.testServer.setPaths(testPaths);
-            cors && this.corsServer.setPaths(cors);
+            testServer.setPaths(testPaths);
+            cors && corsServer.setPaths(cors);
             await this.openTestPage(`http://localhost:${TEST_SERVER_PORT}`, gotoOptions);
         };
 
-        this.global.corsURL = this.corsServer.url;
+        global.corsURL = corsServer.url;
     }
 
     /**
@@ -377,13 +416,13 @@ export default class CustomJestEnvironment extends TestEnvironment {
             }
 
             this.global.popupUtils = {
-                click: async (selector) => await sendToPopup('click', selector),
-                exists: async (selector) => await sendToPopup('exists', selector),
+                click: async (selector) => await sendToPopup('popup-click', selector),
             };
 
             this.global.devtoolsUtils = {
-                paste: async (fixes) => await applyDevtoolsConfig('debug-devtools-paste', fixes),
-                reset: async () => await applyDevtoolsConfig('debug-devtools-reset'),
+                exists: async (selector) => await sendToDevTools('devtools-exists', selector),
+                paste: async (fixes) => await applyDevtoolsConfig('devtools-paste', fixes),
+                reset: async () => await applyDevtoolsConfig('devtools-reset'),
             };
 
             this.global.backgroundUtils = {
@@ -392,12 +431,36 @@ export default class CustomJestEnvironment extends TestEnvironment {
                 changeChromeStorage: async (region, data) => await sendToBackground('changeChromeStorage', {region, data}),
                 getChromeStorage: async (region, keys) => await sendToBackground('getChromeStorage', {region, keys}),
                 getManifest: async () => await sendToBackground('getManifest'),
-                createTab: async (url) => await sendToBackground('createTab', url),
+                getColorScheme: async () => {
+                    if (this.global.product !== 'firefox') {
+                        throw new Error('Not supported');
+                    }
+                    return await sendToBackground('firefox-getColorScheme');
+                },
+                createTab: async (url) => {
+                    if (this.global.product !== 'firefox') {
+                        throw new Error('Not supported');
+                    }
+                    await sendToBackground('firefox-createTab', url);
+                },
+                emulateColorScheme: async (colorScheme) => {
+                    if (this.global.product !== 'firefox') {
+                        throw new Error('Not supported');
+                    }
+                    await sendToBackground('firefox-emulateColorScheme', colorScheme);
+                },
             };
 
             this.global.pageUtils = {
                 evaluate: async (script) => await sendToPage('firefox-eval', script),
                 expectPageStyles: async (expectations) => await sendToPage('firefox-expectPageStyles', expectations),
+                emulateColorScheme: async (colorScheme) => await sendToPage('firefox-emulateColorScheme', colorScheme),
+                getColorScheme: async () => {
+                    if (this.global.product !== 'firefox') {
+                        throw new Error('Not supported');
+                    }
+                    return await sendToPage('firefox-getColorScheme');
+                },
             };
 
             this.global.awaitForEvent = awaitForEvent;
